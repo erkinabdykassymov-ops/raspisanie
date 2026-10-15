@@ -1121,12 +1121,13 @@
                         <table class="data">
                             <thead>
                                 <tr>
-                                    <th style="width:11%">Класс</th>
-                                    <th style="width:24%">Предмет</th>
-                                    <th style="width:26%">Учитель</th>
-                                    <th style="width:13%">Кабинет</th>
-                                    <th style="width:10%">Группа</th>
-                                    <th style="width:9%">Часов</th>
+                                    <th style="width:10%">Класс</th>
+                                    <th style="width:22%">Предмет</th>
+                                    <th style="width:24%">Учитель</th>
+                                    <th style="width:11%">Кабинет</th>
+                                    <th style="width:9%">Группа</th>
+                                    <th style="width:8%">Часов</th>
+                                    <th style="width:9%" title="Смена класса: 1 или 2">Смена</th>
                                     <th style="width:7%"></th>
                                 </tr>
                             </thead>
@@ -1667,7 +1668,8 @@
     }
 
     /* Независимая проверка готовой сетки */
-    function validate(grid, classes, days, maxSlots, groupsOf) {
+    function validate(grid, classes, days, maxSlots, groupsOf, shiftOff) {
+        const cut = shiftOff && Object.keys(shiftOff).length ? Math.min.apply(null, Object.values(shiftOff)) : Infinity;
         let clash = 0,
             roomClash = 0,
             classGaps = 0,
@@ -1694,9 +1696,10 @@
                                 clash++;
                             else
                                 seenT[k] = true;
-                            if (!tDay[L.teacher + "|" + d])
-                                tDay[L.teacher + "|" + d] = [];
-                            tDay[L.teacher + "|" + d].push(s);
+                            const tk = L.teacher + "|" + d + "|" + (s >= cut ? 1 : 0);
+                            if (!tDay[tk])
+                                tDay[tk] = [];
+                            tDay[tk].push(s);
                         }
                         if (L.room) {
                             const k = L.room + "|" + d + "|" + s;
@@ -1709,7 +1712,7 @@
                     if (groupsHere.size && labels.length > 1 && groupsHere.size < labels.length)
                         lonely++;
                 }
-                for (let s = 0; s < last; s++)
+                for (let s = (shiftOff && shiftOff[c]) || 0; s < last; s++)
                     if (!(grid[c][d][s] || []).length)
                         classGaps++;
             }
@@ -1727,9 +1730,62 @@
             lonely
         };
     }
+
+    function normShift(v) {
+        const t = String(v == null ? "" : v).trim().toLowerCase();
+        if (!t)
+            return "";
+        if (/(^|\D)2|ii|втор|екінш|екинш/.test(t))
+            return "2";
+        return "1";
+    }
+    function solveShifts(rows, opts, run) {
+        const so = {};
+        rows.forEach(r => {
+            const c = (r.cls || "").trim(),
+                sh = normShift(r.shift);
+            if (c && sh && !so[c])
+                so[c] = sh;
+        });
+        const g1 = [],
+            g2 = [];
+        rows.forEach(r => ((so[(r.cls || "").trim()] === "2") ? g2 : g1).push(r));
+        if (!g2.length || !g1.length) {
+            const r0 = run(g2.length ? g2 : g1);
+            if (r0 && !r0.error)
+                r0.shiftOf = so;
+            return r0;
+        }
+        const a = run(g1);
+        if (a.error)
+            return a;
+        const b = run(g2);
+        if (b.error)
+            return b;
+        const off2 = a.maxSlots,
+            total = off2 + b.maxSlots,
+            days = a.days;
+        const E = n => Array.from({ length: n }, () => []);
+        const grid = {};
+        a.classes.forEach(c => grid[c] = a.grid[c].map(day => day.concat(E(b.maxSlots))));
+        b.classes.forEach(c => grid[c] = b.grid[c].map(day => E(off2).concat(day)));
+        const classes = a.classes.concat(b.classes);
+        const groupsOf = Object.assign({}, a.groupsOf, b.groupsOf);
+        const shiftOff = {};
+        b.classes.forEach(c => shiftOff[c] = off2);
+        const stats = validate(grid, classes, days, total, groupsOf, shiftOff);
+        return {
+            classes, groupsOf, days, maxSlots: total, grid,
+            unplaced: a.unplaced + b.unplaced,
+            lonely: a.lonely + b.lonely,
+            problems: (a.problems || []).concat(b.problems || []),
+            subs: [], ms: a.ms + b.ms, stats, ga: a.ga,
+            shiftOf: so, shiftOff, off2
+        };
+    }
     if (typeof module !== "undefined")
         module.exports = {
-            buildSchedule,
+            buildSchedule, solveShifts, normShift,
             validate,
             DEMO,
             weightOf,
@@ -2017,6 +2073,9 @@ function gaSchedule(rows, opts) {
                     groupsOf: plan.groupsOf,
                     days: plan.days,
                     maxSlots: plan.maxSlots,
+                    shiftOf: plan.shiftOf,
+                    shiftOff: plan.shiftOff,
+                    off2: plan.off2,
                     grid: plan.grid,
                     unplaced: plan.unplaced,
                     lonely: plan.lonely,
@@ -2069,7 +2128,8 @@ function gaSchedule(rows, opts) {
                 teacher: r.teacher || "",
                 room: r.room || "",
                 group: r.group || "",
-                hours: r.hours || ""
+                hours: r.hours || "",
+                shift: r.shift || ""
             }));
             subs = Array.isArray(d.subs) ? d.subs : [];
             if (d.opts) {
@@ -2160,7 +2220,8 @@ function gaSchedule(rows, opts) {
                 teacher: (r.teacher || "").trim(),
                 room: (r.room || "").trim(),
                 group: (r.group || "").trim(),
-                hours: parseInt(r.hours, 10) || 0
+                hours: parseInt(r.hours, 10) || 0,
+                shift: normShift(r.shift)
             }));
         }
         function renderRows() {
@@ -2175,6 +2236,7 @@ function gaSchedule(rows, opts) {
                 '<td><input value="' + esc(r.room) + '" data-i="' + i + '" data-f="room" list="dlRoom" placeholder="14"></td>' +
                 '<td><input value="' + esc(r.group) + '" data-i="' + i + '" data-f="group" placeholder="—"></td>' +
                 '<td class="num"><input value="' + esc(r.hours) + '" data-i="' + i + '" data-f="hours" inputmode="numeric"></td>' +
+                '<td class="num"><input value="' + esc(r.shift || "") + '" data-i="' + i + '" data-f="shift" inputmode="numeric" placeholder="1"></td>' +
                 '<td style="text-align:center"><button class="del" data-del="' + i + '" title="Удалить строку" aria-label="Удалить строку">×</button></td>';
                 tb.appendChild(tr);
             });
@@ -2211,7 +2273,8 @@ function gaSchedule(rows, opts) {
             teacher: ["учитель", "преподаватель", "педагог", "мұғалім", "мугалим", "фио", "teacher"],
             room: ["кабинет", "каб", "ауд", "бөлме", "болме", "room"],
             group: ["группа", "подгруппа", "топ", "group"],
-            hours: ["часов", "часы", "час", "сағат", "сагат", "нагрузка", "апталық", "hours"]
+            hours: ["часов", "часы", "час", "сағат", "сагат", "нагрузка", "апталық", "hours"],
+            shift: ["смена", "смен", "ауысым", "shift"]
         };
         function matchCol(title) {
             const t = String(title || "").trim().toLowerCase();
@@ -2257,7 +2320,8 @@ function gaSchedule(rows, opts) {
                         teacher: get("teacher"),
                         room: get("room"),
                         group: get("group"),
-                        hours: hours
+                        hours: hours,
+                        shift: normShift(get("shift"))
                     });
                 }
                 return out;
@@ -2486,9 +2550,9 @@ function gaSchedule(rows, opts) {
                 let res;
                 if ($("#optAlg").value === "ga") {
                     const q = { 120: [1000, 60], 400: [3000, 120], 1200: [10000, 120] }[opts.tries] || [3000, 120];
-                    res = gaSchedule(data, { days: opts.days, maxPerDay: opts.maxPerDay, useSan: opts.useSan, ls: q[0], gens: q[1], seed: (Date.now() % 100000) });
+                    res = solveShifts(data, opts, part => gaSchedule(part, { days: opts.days, maxPerDay: opts.maxPerDay, useSan: opts.useSan, ls: q[0], gens: q[1], seed: (Date.now() % 100000) }));
                 } else {
-                    res = buildSchedule(data, opts);
+                    res = solveShifts(data, opts, part => buildSchedule(part, opts));
                 }
                 $("#build").disabled = false;
                 if (res.error) {
@@ -2725,6 +2789,16 @@ function gaSchedule(rows, opts) {
             ? "Чтобы поменять уроки местами, нажмите на одну клетку, затем на другую. Накладку по учителю или кабинету программа не пропустит."
             : (view === "teacher" ? "Показаны уроки с учётом замен: подменяющий видит чужие уроки у себя." : "Общая сетка: строки — уроки по дням, столбцы — классы.");
         }
+        function slotNum(s) {
+            if (!plan.off2)
+                return String(s + 1);
+            return s >= plan.off2 ? "2 см · " + (s - plan.off2 + 1) : "1 см · " + (s + 1);
+        }
+        function inWindow(c, s) {
+            const o = (plan.shiftOff && plan.shiftOff[c]) || 0;
+            const e = (plan.shiftOff && plan.shiftOff[c] !== undefined) ? plan.maxSlots : (plan.off2 || plan.maxSlots);
+            return s >= o && s < e;
+        }
         function lastUsedSlot(test) {
             let last = 0;
             for (let d = 0; d < plan.days; d++)
@@ -2739,8 +2813,12 @@ function gaSchedule(rows, opts) {
             const lim = lastUsedSlot((d, s) => (plan.grid[c][d][s] || []).length);
             let h = '<table class="sch"><thead><tr><th style="width:110px">Урок</th>' +
             DAY_SHORT.slice(0, plan.days).map(d => "<th>" + d + "</th>").join("") + "</tr></thead><tbody>";
-            for (let s = 0; s <= lim; s++) {
-                h += '<tr><td class="rowhead">' + (s + 1) + " урок</td>";
+            const s0 = (plan.shiftOff && plan.shiftOff[c]) || 0;
+            const shN = plan.off2 ? (plan.shiftOff && plan.shiftOff[c] !== undefined ? 2 : 1) : (plan.shiftOf && plan.shiftOf[c] === "2" ? 2 : 0);
+            if (shN)
+                h = h.replace("<th style=\"width:110px\">Урок", "<th style=\"width:110px\">" + shN + " смена");
+            for (let s = s0; s <= lim; s++) {
+                h += '<tr><td class="rowhead">' + (s - s0 + 1) + " урок</td>";
                 for (let d = 0; d < plan.days; d++) {
                     const at = editable ? ' data-c="' + esc(c) + '" data-d="' + d + '" data-s="' + s + '"' : "";
                     h += "<td>" + boxHTML(plan.grid[c][d][s], d, at) + "</td>";
@@ -2763,7 +2841,14 @@ function gaSchedule(rows, opts) {
             let h = '<table class="sch"><thead><tr><th style="width:110px">Урок</th>' +
             DAY_SHORT.slice(0, plan.days).map(d => "<th>" + d + "</th>").join("") + "</tr></thead><tbody>";
             for (let s = 0; s <= lim; s++) {
-                h += '<tr><td class="rowhead">' + (s + 1) + " урок</td>";
+                if (plan.off2) {
+                    let any = false;
+                    for (let d = 0; d < plan.days && !any; d++)
+                        any = has(d, s);
+                    if (!any)
+                        continue;
+                }
+                h += '<tr><td class="rowhead">' + slotNum(s) + " урок</td>";
                 for (let d = 0; d < plan.days; d++) {
                     const found = [];
                     for (const c of plan.classes)
@@ -2786,7 +2871,7 @@ function gaSchedule(rows, opts) {
             plan.classes.map(c => "<th>" + esc(c) + "</th>").join("") + "</tr></thead><tbody>";
             for (let d = 0; d < plan.days; d++) {
                 for (let s = 0; s < plan.maxSlots; s++) {
-                    h += '<tr' + (s === 0 ? ' class="daysplit"' : '') + '><td class="rowhead">' + (s === 0 ? "<b>" + DAY_NAMES[d] + "</b> · " : "") + (s + 1) + " урок</td>";
+                    h += '<tr' + (s === 0 || s === plan.off2 ? ' class="daysplit"' : '') + '><td class="rowhead">' + (s === 0 ? "<b>" + DAY_NAMES[d] + "</b> · " : "") + slotNum(s) + " урок</td>";
                     for (const c of plan.classes)
                         h += "<td>" + boxHTML(plan.grid[c][d][s], d) + "</td>";
                     h += "</tr>";
@@ -2885,6 +2970,8 @@ function gaSchedule(rows, opts) {
                 B = plan.grid[b.c][b.d][b.s] || [];
             if (!A.length && !B.length)
                 return "Обе клетки пустые";
+            if (!inWindow(b.c, b.s) || !inWindow(a.c, a.s))
+                return "Урок нельзя переносить в другую смену";
             const e1 = freeFor(A, a.c, b.d, b.s);
             if (e1)
                 return e1;
@@ -2893,7 +2980,7 @@ function gaSchedule(rows, opts) {
                 return e2;
             plan.grid[a.c][a.d][a.s] = B;
             plan.grid[b.c][b.d][b.s] = A;
-            plan.stats = validate(plan.grid, plan.classes, plan.days, plan.maxSlots, plan.groupsOf);
+            plan.stats = validate(plan.grid, plan.classes, plan.days, plan.maxSlots, plan.groupsOf, plan.shiftOff);
             renderMetrics();
             saveSoon();
             return true;
@@ -3095,7 +3182,7 @@ function gaSchedule(rows, opts) {
             const out = [["День", "Урок"].concat(plan.classes)];
             for (let d = 0; d < plan.days; d++)
                 for (let s = 0; s < plan.maxSlots; s++) {
-                    const line = [DAY_NAMES[d], (s + 1)];
+                    const line = [DAY_NAMES[d], slotNum(s)];
                     plan.classes.forEach(c => {
                         const box = plan.grid[c][d][s] || [];
                         line.push(box.map(L => {
