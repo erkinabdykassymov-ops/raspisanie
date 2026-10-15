@@ -1171,6 +1171,13 @@
                             </select>
                         </div>
                         <div class="opt">
+                            <label for="optAlg">Алгоритм</label>
+                            <select id="optAlg">
+                                <option value="greedy" selected>Жадный (быстрый)</option>
+                                <option value="ga">Генетический (меньше «окон»)</option>
+                            </select>
+                        </div>
+                        <div class="opt">
                             <label for="optTries">Качество подбора</label>
                             <select id="optTries">
                                 <option value="120">Быстро</option>
@@ -1725,8 +1732,208 @@
             buildSchedule,
             validate,
             DEMO,
-            weightOf
+            weightOf,
+            gaSchedule
         };
+/* ===== GA ENGINE START ===== */
+/* Генетический (меметический) движок: хромосома — перестановка уроков каждого класса,
+   отбор — турнирный, скрещивание — порядковое (OX), мутация — обмен двух генов,
+   локальный «ремонт» — обмены уроков внутри класса, снижающие штраф F(X). */
+function mulberry32(a) {
+    return function() {
+        a |= 0; a = a + 0x6D2B79F5 | 0;
+        let t = Math.imul(a ^ a >>> 15, 1 | a);
+        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+}
+const POP4 = new Uint8Array(1 << 12);
+for (let i = 1; i < POP4.length; i++) POP4[i] = POP4[i >> 1] + (i & 1);
+function gapMask(m) {
+    if (!m) return 0;
+    const hi = 31 - Math.clz32(m), lo = 31 - Math.clz32(m & -m);
+    return hi - lo + 1 - POP4[m];
+}
+function gaSchedule(rows, opts) {
+    const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const days = opts.days, maxPerDay = opts.maxPerDay, useSan = !!opts.useSan;
+    const POP = opts.pop || 60, GENS = opts.gens || 120, ELITE = opts.elite || 4, TK = opts.tk || 3;
+    const PM = opts.pm == null ? 0.3 : opts.pm, LS = opts.ls == null ? 600 : opts.ls;
+    const rnd = mulberry32(opts.seed == null ? 1 : opts.seed);
+    const ri = n => (rnd() * n) | 0;
+    const P = prepare(rows, days, maxPerDay);
+    if (!P.classes.length) return { error: "Нет данных: заполните хотя бы одну строку нагрузки." };
+    const classes = P.classes, C = classes.length;
+    const tid = {}, rid = {}, isT = [];
+    const resOf = (name, teacher) => {
+        const m = teacher ? tid : rid, k = name;
+        if (m[k] == null) { m[k] = isT.length; isT.push(teacher ? 1 : 0); }
+        return m[k];
+    };
+    // сущности-уроки по классам (подгруппы объединены в один «двойной» урок)
+    const ent = [], quota0 = [], subIdx = [], nsub = [];
+    classes.forEach(c => {
+        const list = P.byClass[c], E = [], sub = {};
+        const sid = s => (sub[s] == null ? (sub[s] = Object.keys(sub).length) : sub[s]);
+        const groups = {};
+        list.forEach(r => {
+            if (r.group) { (groups[r.subj] = groups[r.subj] || []).push(r); return; }
+            for (let h = 0; h < r.hours; h++) E.push({ box: [r], sub: sid(r.subj), w: r.w });
+        });
+        for (const s in groups) {
+            const g = groups[s], h = Math.min(...g.map(r => r.hours));
+            for (let k = 0; k < h; k++) E.push({ box: g, sub: sid(s), w: g[0].w });
+        }
+        E.forEach(e => {
+            e.res = [];
+            e.box.forEach(r => {
+                if (r.teacher) e.res.push(resOf(r.teacher, true));
+                if (r.room) e.res.push(resOf("#" + r.room, false));
+            });
+        });
+        ent.push(E); nsub.push(Object.keys(sub).length);
+        quota0.push(spreadDays(Math.min(E.length, days * maxPerDay), days, maxPerDay));
+    });
+    const R = isT.length, D = days, PP = maxPerDay;
+    const cnt = new Int16Array(R * D * PP), mask = new Uint16Array(R * D);
+    const cds = classes.map((c, i) => new Int16Array(D * Math.max(1, nsub[i])));
+    const tgtTab = [];
+    for (let w = 0; w <= 10; w++) { tgtTab[w] = []; for (let n = 0; n <= PP; n++) tgtTab[w][n] = n ? targetSlot(w, n, useSan) : 0; }
+    let H = 0, TG = 0, REP = 0, DP = 0;
+    const posD = classes.map(() => new Int8Array(0)), posS = classes.map(() => new Int8Array(0));
+    function setPos(ci, q) {
+        const n = ent[ci].length, pd = new Int8Array(n), ps = new Int8Array(n);
+        let i = 0;
+        for (let d = 0; d < D; d++) for (let s = 0; s < q[d]; s++) { if (i < n) { pd[i] = d; ps[i] = s; i++; } }
+        posD[ci] = pd; posS[ci] = ps;
+    }
+    function add(ci, e, d, s, q) {
+        const res = e.res;
+        for (let k = 0; k < res.length; k++) {
+            const r = res[k], ix = (r * D + d) * PP + s, c0 = cnt[ix];
+            if (c0 >= 1) H++;
+            cnt[ix] = c0 + 1;
+            if (c0 === 0) {
+                const mi = r * D + d, o = mask[mi], nm = o | (1 << s);
+                if (isT[r]) TG += gapMask(nm) - gapMask(o);
+                mask[mi] = nm;
+            }
+        }
+        const ci2 = d * Math.max(1, nsub[ci]) + e.sub, k2 = cds[ci][ci2];
+        if (k2 >= 1) REP++;
+        cds[ci][ci2] = k2 + 1;
+        DP += Math.abs(s - tgtTab[e.w][q[d]]);
+    }
+    function rem(ci, e, d, s, q) {
+        const res = e.res;
+        for (let k = 0; k < res.length; k++) {
+            const r = res[k], ix = (r * D + d) * PP + s, c0 = cnt[ix] - 1;
+            cnt[ix] = c0;
+            if (c0 >= 1) H--;
+            if (c0 === 0) {
+                const mi = r * D + d, o = mask[mi], nm = o & ~(1 << s);
+                if (isT[r]) TG += gapMask(nm) - gapMask(o);
+                mask[mi] = nm;
+            }
+        }
+        const ci2 = d * Math.max(1, nsub[ci]) + e.sub, k2 = cds[ci][ci2] - 1;
+        cds[ci][ci2] = k2;
+        if (k2 >= 1) REP--;
+        DP -= Math.abs(s - tgtTab[e.w][q[d]]);
+    }
+    const Fnow = () => 4000 * H + 40 * REP + 4 * TG + DP;
+    function load(ind) {
+        cnt.fill(0); mask.fill(0); cds.forEach(a => a.fill(0)); H = TG = REP = DP = 0;
+        for (let ci = 0; ci < C; ci++) {
+            setPos(ci, ind.q[ci]);
+            const pm = ind.g[ci], E = ent[ci], pd = posD[ci], ps = posS[ci];
+            for (let i = 0; i < pm.length; i++) add(ci, E[pm[i]], pd[i], ps[i], ind.q[ci]);
+        }
+    }
+    function save(ind) { ind.H = H; ind.TG = TG; ind.REP = REP; ind.DP = DP; ind.F = Fnow(); }
+    function localSearch(ind, tries) {
+        // перестановки уроков внутри класса, принимаются только те, что не ухудшают F
+        for (let t = 0; t < tries; t++) {
+            const ci = ri(C), pm = ind.g[ci], n = pm.length;
+            if (n < 2) continue;
+            const i = ri(n); let j = ri(n);
+            if (i === j) continue;
+            const E = ent[ci], a = E[pm[i]], b = E[pm[j]], q = ind.q[ci];
+            const di = posD[ci][i], si = posS[ci][i], dj = posD[ci][j], sj = posS[ci][j];
+            const f0 = Fnow();
+            rem(ci, a, di, si, q); rem(ci, b, dj, sj, q);
+            add(ci, a, dj, sj, q); add(ci, b, di, si, q);
+            if (Fnow() <= f0) { const x = pm[i]; pm[i] = pm[j]; pm[j] = x; }
+            else {
+                rem(ci, a, dj, sj, q); rem(ci, b, di, si, q);
+                add(ci, a, di, si, q); add(ci, b, dj, sj, q);
+            }
+        }
+    }
+    const randInd = () => {
+        const ind = { g: [], q: [] };
+        for (let ci = 0; ci < C; ci++) {
+            const n = ent[ci].length, a = new Int32Array(n);
+            for (let i = 0; i < n; i++) a[i] = i;
+            for (let i = n - 1; i > 0; i--) { const j = ri(i + 1), x = a[i]; a[i] = a[j]; a[j] = x; }
+            ind.g.push(a); ind.q.push(Int8Array.from(quota0[ci]));
+        }
+        return ind;
+    };
+    const copy = s => ({ g: s.g.map(a => Int32Array.from(a)), q: s.q.map(a => Int8Array.from(a)), F: s.F, H: s.H, TG: s.TG, REP: s.REP, DP: s.DP });
+    function ox(a, b) {
+        const n = a.length; if (n < 2) return Int32Array.from(a);
+        let i = ri(n), j = ri(n); if (i > j) { const x = i; i = j; j = x; }
+        const ch = new Int32Array(n).fill(-1), used = new Uint8Array(n);
+        for (let k = i; k <= j; k++) { ch[k] = a[k]; used[a[k]] = 1; }
+        let p = 0;
+        for (let k = 0; k < n; k++) { if (!used[b[k]]) { while (ch[p] !== -1) p++; ch[p] = b[k]; } }
+        return ch;
+    }
+    // начальная популяция
+    let pop = [];
+    for (let k = 0; k < POP; k++) { const ind = randInd(); load(ind); save(ind); pop.push(ind); }
+    const history = []; let firstFeasible = null;
+    pop.sort((x, y) => x.F - y.F);
+    history.push([pop[0].F, pop[0].H, pop[0].TG, pop[0].REP]);
+    if (pop[0].H === 0) firstFeasible = 0;
+    const tour = () => { let b = pop[ri(POP)]; for (let k = 1; k < TK; k++) { const c = pop[ri(POP)]; if (c.F < b.F) b = c; } return b; };
+    for (let gen = 1; gen <= GENS; gen++) {
+        const nxt = pop.slice(0, ELITE).map(copy);
+        while (nxt.length < POP) {
+            const pa = tour(), pb = tour(), ch = { g: [], q: [] };
+            for (let ci = 0; ci < C; ci++) {
+                ch.g.push(ox(pa.g[ci], pb.g[ci]));
+                ch.q.push(Int8Array.from((rnd() < .5 ? pa : pb).q[ci]));
+                if (rnd() < PM && ch.g[ci].length > 1) { const i = ri(ch.g[ci].length), j = ri(ch.g[ci].length), x = ch.g[ci][i]; ch.g[ci][i] = ch.g[ci][j]; ch.g[ci][j] = x; }
+                if (rnd() < 0.05) { const a = ri(D), b = ri(D), q = ch.q[ci]; if (a !== b && q[a] > 1 && q[b] < PP) { q[a]--; q[b]++; } }
+            }
+            load(ch); localSearch(ch, LS); save(ch); nxt.push(ch);
+        }
+        pop = nxt; pop.sort((x, y) => x.F - y.F);
+        history.push([pop[0].F, pop[0].H, pop[0].TG, pop[0].REP]);
+        if (firstFeasible == null && pop[0].H === 0) firstFeasible = gen;
+    }
+    const best = pop[0];
+    // сборка сетки в формате движка
+    let maxSlots = 1; best.q.forEach(q => q.forEach(v => maxSlots = Math.max(maxSlots, v)));
+    const grid = {}; let unplaced = 0;
+    classes.forEach((c, ci) => {
+        grid[c] = Array.from({ length: days }, () => Array.from({ length: maxSlots }, () => []));
+        setPos(ci, best.q[ci]);
+        for (let i = 0; i < best.g[ci].length; i++) {
+            const e = ent[ci][best.g[ci][i]];
+            grid[c][posD[ci][i]][posS[ci][i]] = e.box.slice();
+        }
+    });
+    P.classes.forEach(c => { let need = 0; P.byClass[c].forEach(r => need += r.hours); });
+    const stats = validate(grid, classes, days, maxSlots, P.groupsOf);
+    const t1 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    return { classes, groupsOf: P.groupsOf, days, maxSlots, grid, unplaced, lonely: stats.lonely, problems: P.problems, subs: [],
+        ms: Math.round(t1 - t0), stats, ga: { history, firstFeasible, F: best.F, H: best.H, TG: best.TG, REP: best.REP, DP: best.DP } };
+}
+/* ===== GA ENGINE END ===== */
+
     // ===== ENGINE END =====
 
     /* ---------------- интерфейс ---------------- */
@@ -1802,7 +2009,8 @@
                     days: $("#optDays").value,
                     max: $("#optMax").value,
                     san: $("#optSan").value,
-                    tries: $("#optTries").value
+                    tries: $("#optTries").value,
+                    alg: $("#optAlg").value
                 },
                 plan: plan ? {
                     classes: plan.classes,
@@ -1873,6 +2081,8 @@
                     $("#optSan").value = d.opts.san;
                 if (d.opts.tries)
                     $("#optTries").value = d.opts.tries;
+                if (d.opts.alg)
+                    $("#optAlg").value = d.opts.alg;
             }
             renderRows();
             if (d.plan && d.plan.grid) {
@@ -2271,9 +2481,15 @@
                 tries: +$("#optTries").value
             };
             $("#build").disabled = true;
-            $("#runInfo").textContent = "считаю…";
+            $("#runInfo").textContent = ($("#optAlg").value === "ga" ? "генетический алгоритм считает (до 20 с)…" : "считаю…");
             setTimeout(() => {
-                const res = buildSchedule(data, opts);
+                let res;
+                if ($("#optAlg").value === "ga") {
+                    const q = { 120: [1000, 60], 400: [3000, 120], 1200: [10000, 120] }[opts.tries] || [3000, 120];
+                    res = gaSchedule(data, { days: opts.days, maxPerDay: opts.maxPerDay, useSan: opts.useSan, ls: q[0], gens: q[1], seed: (Date.now() % 100000) });
+                } else {
+                    res = buildSchedule(data, opts);
+                }
                 $("#build").disabled = false;
                 if (res.error) {
                     $("#runInfo").textContent = "";
